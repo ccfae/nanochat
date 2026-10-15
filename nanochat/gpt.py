@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 from nanochat.common import get_dist_info, print0, COMPUTE_DTYPE
 from nanochat.optim import MuonAdamW
@@ -33,6 +34,9 @@ class GPTConfig:
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    # Number of token positions processed by the LM head at once when computing
+    # training loss. <= 0 disables chunking and materializes the full logits.
+    logit_chunk_size: int = 4096
     # Sliding window attention pattern string, tiled across layers. Final layer always L.
     # Characters: L=long (full context), S=short (quarter context)
     # Examples: "L"=all full context, "SL"=alternating, "SSL"=two short then one long
@@ -53,6 +57,14 @@ class Linear(nn.Linear):
 def has_ve(layer_idx, n_layer):
     """Returns True if GPT layer should have Value Embedding (alternating, last layer always included)."""
     return layer_idx % 2 == (n_layer - 1) % 2
+
+
+def linear_cross_entropy_chunk(hidden, weight, targets, vocab_size, softcap):
+    """Cross-entropy for one group of token positions without retaining logits."""
+    logits = F.linear(hidden, weight.to(dtype=hidden.dtype))
+    logits = logits[..., :vocab_size].float()
+    logits = softcap * torch.tanh(logits / softcap)
+    return F.cross_entropy(logits, targets, ignore_index=-1, reduction="none")
 
 def apply_rotary_emb(x, cos, sin):
     # note: this rotates by -theta, the transpose of the textbook convention. Functionally
@@ -186,10 +198,11 @@ class GPT(nn.Module):
         self.smear_lambda = nn.Parameter(torch.zeros(1))
         # Backout: subtract cached mid-layer residual before final norm to remove low-level features
         self.backout_lambda = nn.Parameter(0.2 * torch.ones(1))
-        # Value embeddings (ResFormer-style): alternating layers, last layer always included
+        # Shared value embedding (ResFormer-style): alternating layers use the same table.
+        # Sharing keeps the feature while avoiding one vocab-sized table per VE layer.
         head_dim = config.n_embd // config.n_head
         kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({str(i): nn.Embedding(padded_vocab_size, kv_dim) for i in range(config.n_layer) if has_ve(i, config.n_layer)})
+        self.value_embed = nn.Embedding(padded_vocab_size, kv_dim)
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
@@ -245,9 +258,8 @@ class GPT(nn.Module):
         torch.nn.init.constant_(self.backout_lambda, 0.2)
         torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
 
-        # Value embeddings (init like c_v: uniform with same std)
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
+        # Shared value embedding (init like c_v: uniform with same std)
+        torch.nn.init.uniform_(self.value_embed.weight, -s, s)
 
         # Gate weights init with small positive values so gates start slightly above neutral
         for block in self.transformer.h:
@@ -264,8 +276,7 @@ class GPT(nn.Module):
         # because GradScaler cannot unscale fp16 gradients.
         if COMPUTE_DTYPE != torch.float16:
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
-            for ve in self.value_embeds.values():
-                ve.to(dtype=COMPUTE_DTYPE)
+            self.value_embed.to(dtype=COMPUTE_DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
@@ -336,6 +347,10 @@ class GPT(nn.Module):
             effective_seq = t if window < 0 else min(window, t)
             attn_flops += 12 * h * q * effective_seq
         num_flops_per_token = 6 * self.num_matmul_params() + attn_flops
+        # Chunked loss checkpoints the LM-head/CE operation, so backward recomputes
+        # one additional LM-head forward pass (2 FLOPs per weight and token).
+        if self.config.logit_chunk_size > 0:
+            num_flops_per_token += 2 * self.lm_head.weight.numel()
         return num_flops_per_token
 
     def num_matmul_params(self):
@@ -401,7 +416,7 @@ class GPT(nn.Module):
         """
         # Count each group separately (mirrors the grouping in setup_optimizers)
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
+        value_embeds = sum(p.numel() for p in self.value_embed.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel() + self.smear_gate.weight.numel() + self.smear_lambda.numel() + self.backout_lambda.numel()
@@ -421,7 +436,7 @@ class GPT(nn.Module):
 
         # Separate out all parameters into groups
         matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
+        value_embeds_params = list(self.value_embed.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         resid_params = [self.resid_lambdas]
@@ -496,9 +511,11 @@ class GPT(nn.Module):
         n_layer = self.config.n_layer
         backout_layer = n_layer // 2  # cache at halfway point
         x_backout = None
+        # Look up the shared VE once, then reuse it in every selected layer.
+        shared_ve = self.value_embed(idx).to(x.dtype)
         for i, block in enumerate(self.transformer.h):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx).to(x.dtype) if str(i) in self.value_embeds else None
+            ve = shared_ve if has_ve(i, n_layer) else None
             x = block(x, ve, cos_sin, self.window_sizes[i], kv_cache)
             if i == backout_layer:
                 x_backout = x
@@ -507,21 +524,47 @@ class GPT(nn.Module):
             x = x - self.backout_lambda.to(x.dtype) * x_backout
         x = norm(x)
 
-        # Forward the lm_head (compute logits)
+        # During training, process token positions in chunks so the very large
+        # (B*T, vocab_size) logits tensor is never fully materialized. Checkpointing
+        # discards each chunk's logits after forward and recomputes it in backward.
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
-        logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
-        logits = logits[..., :self.config.vocab_size] # slice to remove padding
-        logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        logits = softcap * torch.tanh(logits / softcap) # squash the logits
-
         if targets is not None:
-            # training: given the targets, compute and return the loss
-            # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            return loss
-        else:
-            # inference: just return the logits directly
-            return logits
+            hidden_flat = x.reshape(-1, x.size(-1))
+            targets_flat = targets.reshape(-1)
+            num_positions = hidden_flat.size(0)
+            configured_chunk_size = self.config.logit_chunk_size
+            chunk_size = num_positions if configured_chunk_size <= 0 else min(configured_chunk_size, num_positions)
+            use_checkpoint = torch.is_grad_enabled() and chunk_size < num_positions
+            loss_chunks = []
+            for start in range(0, num_positions, chunk_size):
+                end = min(start + chunk_size, num_positions)
+                args = (
+                    hidden_flat[start:end], self.lm_head.weight, targets_flat[start:end],
+                    self.config.vocab_size, softcap,
+                )
+                if use_checkpoint:
+                    loss_chunk = checkpoint(
+                        linear_cross_entropy_chunk, *args, use_reentrant=False
+                    )
+                else:
+                    loss_chunk = linear_cross_entropy_chunk(*args)
+                loss_chunks.append(loss_chunk)
+            losses = torch.cat(loss_chunks)
+            if loss_reduction == 'none':
+                return losses
+            loss_sum = losses.sum()
+            if loss_reduction == 'sum':
+                return loss_sum
+            if loss_reduction == 'mean':
+                valid_tokens = (targets_flat != -1).sum()
+                return loss_sum / valid_tokens
+            raise ValueError(f"Invalid loss_reduction: {loss_reduction}")
+
+        # Inference needs the full logits for sampling.
+        logits = self.lm_head(x)
+        logits = logits[..., :self.config.vocab_size]
+        logits = logits.float()
+        return softcap * torch.tanh(logits / softcap)
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):

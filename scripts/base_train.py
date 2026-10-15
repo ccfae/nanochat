@@ -25,7 +25,7 @@ import wandb
 import torch
 import torch.distributed as dist
 
-from nanochat.gpt import GPT, GPTConfig, Linear
+from nanochat.gpt import GPT, GPTConfig, Linear, has_ve
 from nanochat.dataloader import tokenizing_distributed_data_loader_bos_bestfit, tokenizing_distributed_data_loader_with_state_bos_bestfit
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type, get_peak_flops, COMPUTE_DTYPE, COMPUTE_DTYPE_REASON, is_ddp_initialized
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -47,11 +47,12 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
 # Model architecture
-parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
+parser.add_argument("--depth", type=int, default=12, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
+parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=quarter context (e.g. 'SSL')")
+parser.add_argument("--logit-chunk-size", type=int, default=4096, help="token positions per LM-head/loss chunk (<=0 disables chunking)")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -136,7 +137,7 @@ def build_model_meta(depth):
     config = GPTConfig(
         sequence_len=args.max_seq_len, vocab_size=vocab_size,
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
-        window_pattern=args.window_pattern,
+        window_pattern=args.window_pattern, logit_chunk_size=args.logit_chunk_size,
     )
     with torch.device("meta"):
         model_meta = GPT(config)
@@ -355,6 +356,24 @@ total_tokens = total_batch_size * num_iterations # the actual number of tokens w
 print0(f"Total number of training tokens: {total_tokens:,}")
 print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
+
+# Record the resolved architecture and derived training budget, not just the raw CLI
+# arguments. This makes W&B runs comparable even when defaults change over time.
+if not use_dummy_wandb:
+    wandb_run.config.update({
+        "architecture_variant": f"d{model_config.n_layer}-shared-ve",
+        "value_embedding_mode": "shared",
+        "value_embedding_layers": [i for i in range(model_config.n_layer) if has_ve(i, model_config.n_layer)],
+        "model_config": model_config_kwargs,
+        "parameter_counts": param_counts,
+        "scaling_parameters": num_scaling_params,
+        "target_tokens": target_tokens,
+        "total_tokens": total_tokens,
+        "num_iterations_resolved": num_iterations,
+        "total_batch_size_resolved": total_batch_size,
+        "estimated_flops_per_token": num_flops_per_token,
+        "estimated_total_training_flops": num_flops_per_token * total_tokens,
+    }, allow_val_change=True)
 
 # Learning rate schedule (linear warmup, constant, linear warmdown)
 def get_lr_multiplier(it):

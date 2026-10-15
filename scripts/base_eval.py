@@ -27,8 +27,9 @@ import zipfile
 import tempfile
 import argparse
 import torch
+import wandb
 
-from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock
+from nanochat.common import compute_init, compute_cleanup, print0, get_base_dir, autodetect_device_type, download_file_with_lock, DummyWandb
 from nanochat.tokenizer import get_token_bytes
 from nanochat.checkpoint_manager import load_model
 from nanochat.core_eval import evaluate_task
@@ -54,16 +55,27 @@ def place_eval_bundle(file_path):
     print0(f"Placed eval_bundle directory at {eval_bundle_dir}")
 
 
+def ensure_eval_bundle():
+    """Download or unpack the CORE bundle and return its directory."""
+    base_dir = get_base_dir()
+    eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
+    if os.path.isdir(eval_bundle_dir):
+        return eval_bundle_dir
+    archive_path = os.path.join(base_dir, "eval_bundle.zip")
+    if os.path.isfile(archive_path):
+        place_eval_bundle(archive_path)
+    else:
+        download_file_with_lock(EVAL_BUNDLE_URL, "eval_bundle.zip", postprocess_fn=place_eval_bundle)
+    return eval_bundle_dir
+
+
 def evaluate_core(model, tokenizer, device, max_per_task=-1):
     """
     Evaluate a base model on the CORE benchmark.
     Returns dict with results, centered_results, and core_metric.
     """
     base_dir = get_base_dir()
-    eval_bundle_dir = os.path.join(base_dir, "eval_bundle")
-    # Download the eval bundle if needed
-    if not os.path.exists(eval_bundle_dir):
-        download_file_with_lock(EVAL_BUNDLE_URL, "eval_bundle.zip", postprocess_fn=place_eval_bundle)
+    eval_bundle_dir = ensure_eval_bundle()
 
     config_path = os.path.join(eval_bundle_dir, "core.yaml")
     data_base_path = os.path.join(eval_bundle_dir, "eval_data")
@@ -134,6 +146,7 @@ def main():
     parser.add_argument('--device-batch-size', type=int, default=32, help='Per-device batch size for BPB evaluation')
     parser.add_argument('--split-tokens', type=int, default=40*524288, help='Number of tokens to evaluate per split for BPB')
     parser.add_argument('--device-type', type=str, default='', help='cuda|cpu|mps (empty = autodetect)')
+    parser.add_argument('--run', type=str, default='dummy', help="W&B run name ('dummy' disables W&B logging)")
     args = parser.parse_args()
 
     # Parse evaluation modes
@@ -152,6 +165,18 @@ def main():
     token_bytes = get_token_bytes(device=device)
     model_name = f"base_model (step {meta['step']})"
     model_slug = f"base_model_{meta['step']:06d}"
+    resolved_model_tag = args.model_tag or f"d{model.config.n_layer}"
+    use_dummy_wandb = args.run == "dummy" or ddp_rank != 0
+    wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(
+        project="nanochat-base-eval",
+        name=args.run,
+        config={
+            **vars(args),
+            "resolved_model_tag": resolved_model_tag,
+            "checkpoint_step": meta["step"],
+            "model_config": meta["model_config"],
+        },
+    )
 
     print0(f"Evaluating model: {model_name}")
     print0(f"Eval modes: {', '.join(sorted(eval_modes))}")
@@ -224,7 +249,7 @@ def main():
         # Write CSV output
         if ddp_rank == 0:
             base_dir = get_base_dir()
-            output_csv_path = os.path.join(base_dir, "base_eval", f"{model_slug}.csv")
+            output_csv_path = os.path.join(base_dir, "base_eval", resolved_model_tag, f"{model_slug}.csv")
             os.makedirs(os.path.dirname(output_csv_path), exist_ok=True)
             with open(output_csv_path, 'w', encoding='utf-8', newline='') as f:
                 f.write(f"{'Task':<35}, {'Accuracy':<10}, {'Centered':<10}\n")
@@ -236,6 +261,35 @@ def main():
             print0(f"\nResults written to: {output_csv_path}")
             print0(f"CORE metric: {core_results['core_metric']:.4f}")
 
+    if ddp_rank == 0:
+        result_payload = {
+            "source": "base",
+            "model_tag": resolved_model_tag,
+            "step": meta["step"],
+            "model_config": meta["model_config"],
+            "eval_modes": sorted(eval_modes),
+            "bpb": bpb_results,
+            "core": core_results,
+            "conditioned_samples": samples,
+            "unconditioned_samples": unconditioned_samples,
+        }
+        result_dir = os.path.join(get_base_dir(), "base_eval", resolved_model_tag)
+        os.makedirs(result_dir, exist_ok=True)
+        result_path = os.path.join(result_dir, f"{model_slug}.json")
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(result_payload, f, ensure_ascii=False, indent=2)
+        print0(f"Complete evaluation results written to: {result_path}")
+
+        wandb_metrics = {
+            "checkpoint_step": meta["step"],
+            **{f"bpb/{split}": value for split, value in bpb_results.items()},
+        }
+        if core_results is not None:
+            wandb_metrics["core_metric"] = core_results["core_metric"]
+            wandb_metrics.update({f"core/{name}": value for name, value in core_results["results"].items()})
+        wandb_run.log(wandb_metrics)
+
+    wandb_run.finish()
     compute_cleanup()
 
 

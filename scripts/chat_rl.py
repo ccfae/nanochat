@@ -317,7 +317,9 @@ for step in range(num_steps):
             model.state_dict(),
             None, # note: we don't bother to save the optimizer state
             {
+                "step": step,
                 "model_config": model_config_kwargs,
+                "user_config": user_config,
             }
         )
         print(f"✅ Saved model checkpoint to {checkpoint_dir}")

@@ -77,6 +77,12 @@ def test_tricky_string_content():
     assert result.success
 
 
+def test_large_output_does_not_deadlock():
+    result = execute_code("print('x' * 1_000_000)", timeout=2.0)
+    assert result.success
+    assert len(result.stdout) == 1_000_001
+
+
 def test_fresh_globals():
     # user code must not see the guard prelude's imports
     result = execute_code("print('GUARD' in dir())")

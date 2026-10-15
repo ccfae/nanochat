@@ -24,8 +24,11 @@ accidental destructive behavior, but it is not safe against malicious adversaria
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from typing import Optional
+
+import psutil
 
 # -----------------------------------------------------------------------------
 
@@ -99,34 +102,71 @@ def execute_code(
     program = guard + f"\nexec(compile({code!r}, '<llm>', 'exec'), {{'__name__': '__main__'}})\n"
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        try:
-            process = subprocess.run(
-                [sys.executable, "-c", program],
-                cwd=tmpdir, # writes land in the tempdir, deleted afterwards
-                env={"PATH": "/usr/bin:/bin"}, # scrub the environment
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-            )
-        except subprocess.TimeoutExpired:
-            # subprocess.run kills the child process on timeout
+        process = subprocess.Popen(
+            [sys.executable, "-c", program],
+            cwd=tmpdir, # writes land in the tempdir, deleted afterwards
+            env={"PATH": "/usr/bin:/bin"}, # scrub the environment
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        # Darwin does not reliably enforce the address-space rlimit used in the
+        # child guard. Monitor resident memory from the parent so the documented
+        # limit also holds on macOS. Linux continues to use kernel rlimits.
+        child = psutil.Process(process.pid) if sys.platform == "darwin" else None
+        deadline = time.monotonic() + timeout
+        memory_exceeded = False
+        timed_out = False
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                timed_out = True
+                process.kill()
+                break
+            try:
+                # communicate drains both pipes while the child runs, avoiding a
+                # deadlock when generated code produces more than a pipe buffer.
+                stdout, stderr = process.communicate(timeout=min(0.01, remaining))
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if child is not None and maximum_memory_bytes is not None:
+                try:
+                    if child.memory_info().rss > maximum_memory_bytes:
+                        memory_exceeded = True
+                        process.kill()
+                        break
+                except psutil.NoSuchProcess:
+                    break
+
+        if process.returncode is None:
+            stdout, stderr = process.communicate()
+        if timed_out:
             return ExecutionResult(
                 success=False,
-                stdout="",
-                stderr="",
+                stdout=stdout,
+                stderr=stderr,
                 error="Execution timed out (process killed)",
                 timeout=True,
             )
+        if memory_exceeded:
+            return ExecutionResult(
+                success=False,
+                stdout=stdout,
+                stderr=stderr,
+                error="Memory limit exceeded (process killed)",
+                memory_exceeded=True,
+            )
 
     success = process.returncode == 0
-    stderr = process.stderr
     # the last line of the traceback identifies the exception, e.g. "TypeError: ..."
     error = None if success else (stderr.strip().splitlines() or ["Execution failed"])[-1]
     memory_exceeded = "MemoryError" in stderr
     result = ExecutionResult(
         success=success,
-        stdout=process.stdout,
+        stdout=stdout,
         stderr=stderr,
         error=error,
         memory_exceeded=memory_exceeded,

@@ -127,6 +127,20 @@ print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {args.total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 token_bytes = get_token_bytes(device=device)
 
+# Carry the actual base-model architecture and resolved batch settings into the
+# SFT run so it can be traced back to the matching pretraining experiment.
+if not use_dummy_wandb:
+    wandb_run.config.update({
+        "architecture_variant": f"d{model.config.n_layer}-shared-ve",
+        "value_embedding_mode": "shared",
+        "base_model_config": meta.get("model_config", {}),
+        "base_parameter_counts": orig_model.num_scaling_params(),
+        "resolved_max_seq_len": args.max_seq_len,
+        "resolved_device_batch_size": args.device_batch_size,
+        "resolved_total_batch_size": args.total_batch_size,
+        "gradient_accumulation_steps": grad_accum_steps,
+    }, allow_val_change=True)
+
 # Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
 # Note that pretraining ramps weight_decay to zero by end of pretraining, so SFT continues with zero
 optimizer = model.setup_optimizer(unembedding_lr=args.unembedding_lr, embedding_lr=args.embedding_lr, matrix_lr=args.matrix_lr, weight_decay=0.0)
@@ -199,7 +213,6 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
     cursor = ddp_rank  # Each rank processes different conversations (for fetching)
     consumed = ddp_rank  # Track actual consumption separately from buffering
     epoch = 1
-    it = 0  # iteration counter
 
     def refill_buffer():
         nonlocal cursor, epoch
@@ -260,18 +273,10 @@ def sft_data_generator_bos_bestfit(split, buffer_size=100):
             rows.append(row[:row_capacity])
             mask_rows.append(mask_row[:row_capacity])
 
-        # Stopping condition to respect num_iterations, if given
-        it += 1
-        if 0 < args.num_iterations <= it and split == "train":
-            last_step = True
-
         # Update progress tracking (based on consumed, not cursor, to account for buffering)
         if split == "train":
             current_epoch = epoch
-            if args.num_iterations > 0:
-                approx_progress = it / args.num_iterations
-            else:
-                approx_progress = consumed / dataset_size
+            approx_progress = consumed / dataset_size
             # Trigger last_step when we've consumed enough (instead of when cursor wraps)
             if consumed >= dataset_size:
                 last_step = True
@@ -407,6 +412,7 @@ while True:
                     "n_head": model.config.n_head,
                     "n_kv_head": model.config.n_kv_head,
                     "n_embd": model.config.n_embd,
+                    "logit_chunk_size": model.config.logit_chunk_size,
                     "window_pattern": model.config.window_pattern,
                 },
                 "user_config": user_config, # inputs to the training script
@@ -431,7 +437,11 @@ while True:
         else:
             loss.backward()
         x, y = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-        progress = max(progress, approx_progress) # only increase progress monotonically
+        if args.num_iterations > 0:
+            # num_iterations counts optimizer steps, not prefetched micro-batches.
+            progress = step / args.num_iterations
+        else:
+            progress = max(progress, approx_progress) # only increase progress monotonically
     # step the optimizer
     lrm = get_lr_multiplier(progress)
     muon_momentum = get_muon_momentum(step)
@@ -456,6 +466,8 @@ while True:
 
     # State
     step += 1
+    if args.num_iterations > 0 and step >= args.num_iterations:
+        last_step = True
 
     # logging
     smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss.item() # EMA the training loss

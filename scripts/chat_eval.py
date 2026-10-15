@@ -9,11 +9,14 @@ torchrun --nproc_per_node=8 -m scripts.chat_eval -- -i sft -a ARC-Easy
 """
 
 import argparse
+import json
+import os
 from functools import partial
 import torch
 import torch.distributed as dist
+import wandb
 
-from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type
+from nanochat.common import compute_init, compute_cleanup, get_dist_info, print0, autodetect_device_type, get_base_dir, DummyWandb
 from nanochat.checkpoint_manager import load_model
 from nanochat.engine import Engine
 
@@ -190,6 +193,7 @@ if __name__ == "__main__":
     parser.add_argument('-s', '--step', type=int, default=None, help='Step to load')
     parser.add_argument('-x', '--max-problems', type=int, default=None, help='Max problems to evaluate')
     parser.add_argument('--device-type', type=str, default='', choices=['cuda', 'cpu', 'mps'], help='Device type for evaluation: cuda|cpu|mps. empty => autodetect')
+    parser.add_argument('--run', type=str, default='dummy', help="W&B run name ('dummy' disables W&B logging)")
     args = parser.parse_args()
 
     device_type = autodetect_device_type() if args.device_type == "" else args.device_type
@@ -197,6 +201,19 @@ if __name__ == "__main__":
 
     model, tokenizer, meta = load_model(args.source, device, phase="eval", model_tag=args.model_tag, step=args.step)
     engine = Engine(model, tokenizer)
+    resolved_model_tag = args.model_tag or f"d{model.config.n_layer}"
+    checkpoint_step = meta.get("step", args.step)
+    use_dummy_wandb = args.run == "dummy" or ddp_rank != 0
+    wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(
+        project="nanochat-chat-eval",
+        name=args.run,
+        config={
+            **vars(args),
+            "resolved_model_tag": resolved_model_tag,
+            "checkpoint_step": checkpoint_step,
+            "model_config": meta.get("model_config", {}),
+        },
+    )
 
     # Get the tasks to evaluate on
     all_tasks = ['ARC-Easy', 'ARC-Challenge', 'MMLU', 'GSM8K', 'HumanEval']
@@ -228,13 +245,52 @@ if __name__ == "__main__":
     # calculate the ChatCORE metric if we can (similar to CORE, it's the mean centered accuracy)
     # this way, ChatCORE ranges from 0 (at random baseline) to 1 (peak performance)
     all_tasks_were_evaluated = all(task_name in results for task_name in all_tasks)
+    chatcore_metric = None
+    centered_results = {}
     if all_tasks_were_evaluated:
         centered_mean = 0
         for task_name, acc in results.items():
             baseline_acc = baseline_accuracies.get(task_name, 0.0)
             centered_acc = (acc - baseline_acc) / (1.0 - baseline_acc)
+            centered_results[task_name] = centered_acc
             centered_mean += centered_acc
         chatcore_metric = centered_mean / len(results)
         print0(f"ChatCORE metric: {chatcore_metric:.4f}")
 
+    if ddp_rank == 0:
+        result_payload = {
+            "source": args.source,
+            "model_tag": resolved_model_tag,
+            "step": checkpoint_step,
+            "model_config": meta.get("model_config", {}),
+            "settings": {
+                "tasks": task_names,
+                "temperature": args.temperature,
+                "max_new_tokens": args.max_new_tokens,
+                "num_samples": args.num_samples,
+                "top_k": args.top_k,
+                "batch_size": args.batch_size,
+                "max_problems": args.max_problems,
+            },
+            "accuracy": results,
+            "centered_accuracy": centered_results,
+            "chatcore_metric": chatcore_metric,
+        }
+        step_slug = "latest" if checkpoint_step is None else f"{checkpoint_step:06d}"
+        result_dir = os.path.join(get_base_dir(), "chat_eval", args.source, resolved_model_tag)
+        os.makedirs(result_dir, exist_ok=True)
+        result_path = os.path.join(result_dir, f"step_{step_slug}.json")
+        with open(result_path, "w", encoding="utf-8") as f:
+            json.dump(result_payload, f, ensure_ascii=False, indent=2)
+        print0(f"Evaluation results written to: {result_path}")
+
+        wandb_metrics = {f"accuracy/{task}": value for task, value in results.items()}
+        if chatcore_metric is not None:
+            wandb_metrics["chatcore_metric"] = chatcore_metric
+            wandb_metrics.update({f"centered_accuracy/{task}": value for task, value in centered_results.items()})
+        if checkpoint_step is not None:
+            wandb_metrics["checkpoint_step"] = checkpoint_step
+        wandb_run.log(wandb_metrics)
+
+    wandb_run.finish()
     compute_cleanup()
